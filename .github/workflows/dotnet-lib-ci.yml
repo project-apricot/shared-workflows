@@ -1,0 +1,111 @@
+name: .NET library CI
+
+on:
+  workflow_call:
+    inputs:
+      solution_file:
+        description: 'Solution to build (.sln, .slnx) or empty.'
+        required: false
+        type: string
+        default: ''
+      dotnet_versions:
+        description: 'Newline-separated SDK versions to install. List every target when a repo multi-targets.'
+        required: false
+        type: string
+        default: '10.0.x'
+      runs_on:
+        description: 'JSON array of runner labels to matrix over.'
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
+      run_tests:
+        required: false
+        type: boolean
+        default: true
+      working_directory:
+        required: false
+        type: string
+        default: '.'
+
+concurrency:
+  group: ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJson(inputs.runs_on) }}
+
+    runs-on: ${{ matrix.os }}
+
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+
+    env:
+      SOLUTION: ${{ inputs.solution_file }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ inputs.dotnet_versions }}
+
+      - name: Compose CI version
+        id: version
+        env:
+          RUN: ${{ github.run_number }}
+          SHA: ${{ github.sha }}
+        run: echo "version=0.0.0-ci.${RUN}.${SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore
+        run: dotnet restore ${SOLUTION:+"$SOLUTION"}
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dotnet build ${SOLUTION:+"$SOLUTION"} \
+            --no-restore -c Release -p:Version="$VERSION"
+
+      - name: Test
+        if: ${{ inputs.run_tests }}
+        run: |
+          dotnet test ${SOLUTION:+"$SOLUTION"} \
+            --no-build -c Release \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./TestResults \
+            --logger "trx;LogFileName=test-results.trx"
+
+      - name: Pack
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dotnet pack ${SOLUTION:+"$SOLUTION"} \
+            --no-build -c Release -o ./artifacts \
+            -p:Version="$VERSION" -p:PackageVersion="$VERSION"
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ matrix.os }}
+          path: ${{ inputs.working_directory }}/artifacts/*
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload test results
+        if: ${{ inputs.run_tests && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.os }}
+          path: ${{ inputs.working_directory }}/TestResults/**
+          if-no-files-found: warn
+          retention-days: 3

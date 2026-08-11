@@ -1,0 +1,115 @@
+name: Prepare release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Explicit version without the leading v (e.g. 1.2.0). Empty = infer from conventional commits.'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Report the version without creating anything.'
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: 'Mark the GitHub Release as a prerelease. Requires a version with a prerelease suffix.'
+        required: false
+        type: boolean
+        default: false
+      target_branch:
+        description: 'The only branch a release may be cut from.'
+        required: false
+        type: string
+        default: main
+    outputs:
+      version:
+        description: 'The version that was released, no prefix.'
+        value: ${{ jobs.prepare.outputs.version }}
+      tag:
+        description: 'The tag that was created, v-prefixed.'
+        value: ${{ jobs.prepare.outputs.tag }}
+
+concurrency:
+  group: release-prepare-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    uses: project-apricot/shared-workflows/.github/workflows/version-semantic.yml@v1
+    with:
+      branch: ${{ inputs.target_branch }}
+
+  prepare:
+    needs: [version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Plan release
+        id: plan
+        env:
+          BRANCH: ${{ github.ref_name }}
+          TARGET: ${{ inputs.target_branch }}
+          OVERRIDE: ${{ inputs.version }}
+          CURRENT: ${{ needs.version.outputs.current }}
+          INFERRED: ${{ needs.version.outputs.next_semver }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          if [ "$BRANCH" != "$TARGET" ]; then
+            echo "::error::Releases must be cut from '$TARGET', not '$BRANCH'."
+            exit 1
+          fi
+
+          VERSION="${OVERRIDE:-$INFERRED}"
+          VERSION="${VERSION#v}"
+
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$VERSION' is not a valid semantic version."
+            exit 1
+          fi
+
+          if [ -z "$OVERRIDE" ] && [ "${CURRENT#v}" = "$VERSION" ]; then
+            echo "::error::No releasable changes since $CURRENT. Only fix, feat and breaking changes bump the version; pass 'version' to release anyway."
+            exit 1
+          fi
+
+          # The prerelease flag and a semver suffix are independent, and only the suffix
+          # reaches a package feed.
+          if [ "$PRERELEASE" = "true" ]; then
+            case "$VERSION" in
+              *-*) ;;
+              *) echo "::error::prerelease=true needs a suffixed version, e.g. $VERSION-rc.1."; exit 1 ;;
+            esac
+          fi
+
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::Tag v$VERSION already exists."
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "\`$CURRENT\` -> \`v$VERSION\` (dry run: $DRY)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --target "${{ inputs.target_branch }}" \
+            --generate-notes \
+            ${{ inputs.prerelease && '--prerelease' || '' }}

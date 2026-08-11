@@ -1,0 +1,56 @@
+name: Self release
+
+# Releases THIS repo. Not a reusable workflow - callers want release-prepare.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Explicit version without the leading v (e.g. 1.2.0). Empty = infer from conventional commits.'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Report the version without creating anything.'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+
+  prepare:
+    uses: ./.github/workflows/release-prepare.yml
+    with:
+      version: ${{ inputs.version }}
+      dry_run: ${{ inputs.dry_run }}
+
+  # Callers pin the moving major tag, so a release is not finished until it moves.
+  # Releasing 2.0.0 moves v2 and deliberately leaves v1 on the last 1.x.
+  major-tag:
+    needs: [prepare]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Move major tag
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG not found. Was the release created?"
+            exit 1
+          fi
+          MAJOR="v${VERSION%%.*}"
+          git tag -f "$MAJOR" "$TAG"
+          git push -f origin "$MAJOR"
+          echo "\`$MAJOR\` -> \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"

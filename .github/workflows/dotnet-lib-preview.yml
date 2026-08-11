@@ -1,0 +1,113 @@
+name: .NET library preview
+
+# Publishes a prerelease package to GitHub Packages, on demand.
+
+on:
+  workflow_call:
+    inputs:
+      solution_file:
+        description: 'Solution or project to build, relative to working_directory. Optional.'
+        required: false
+        type: string
+        default: ''
+      prerelease_label:
+        required: false
+        type: string
+        default: preview
+      dotnet_versions:
+        description: 'Newline-separated SDK versions to install. List every target when a repo multi-targets.'
+        required: false
+        type: string
+        default: '10.0.x'
+      working_directory:
+        required: false
+        type: string
+        default: '.'
+    outputs:
+      version:
+        description: 'The published prerelease version.'
+        value: ${{ jobs.preview.outputs.version }}
+
+concurrency:
+  group: preview-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  version:
+    uses: project-apricot/shared-workflows/.github/workflows/version-semantic.yml@v1
+    with:
+      prerelease_label: ${{ inputs.prerelease_label }}
+
+  preview:
+    needs: [version]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      version: ${{ needs.version.outputs.next_prerelease }}
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+
+    env:
+      SOLUTION: ${{ inputs.solution_file }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ inputs.dotnet_versions }}
+
+      - name: Restore
+        run: dotnet restore ${SOLUTION:+"$SOLUTION"}
+
+      - name: Build
+        env:
+          VERSION: ${{ needs.version.outputs.next_prerelease }}
+        run: |
+          dotnet build ${SOLUTION:+"$SOLUTION"} \
+            --no-restore -c Release \
+            -p:Version="$VERSION" \
+            -p:ContinuousIntegrationBuild=true
+
+      - name: Test
+        run: dotnet test ${SOLUTION:+"$SOLUTION"} --no-build -c Release
+
+      - name: Pack
+        env:
+          VERSION: ${{ needs.version.outputs.next_prerelease }}
+        run: |
+          dotnet pack ${SOLUTION:+"$SOLUTION"} \
+            --no-build -c Release -o ./artifacts \
+            -p:Version="$VERSION" \
+            -p:PackageVersion="$VERSION" \
+            -p:ContinuousIntegrationBuild=true
+
+      - name: Push to GitHub Packages
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          dotnet nuget push "./artifacts/*.nupkg" \
+            --source "https://nuget.pkg.github.com/${OWNER}/index.json" \
+            --api-key "$GITHUB_TOKEN" \
+            --skip-duplicate
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.version.outputs.next_prerelease }}
+        run: |
+          {
+            echo "### Preview published to GitHub Packages"
+            echo ""
+            echo "\`${VERSION}\`"
+            echo ""
+            echo "Not published to nuget.org, not tagged, no GitHub Release."
+          } >> "$GITHUB_STEP_SUMMARY"

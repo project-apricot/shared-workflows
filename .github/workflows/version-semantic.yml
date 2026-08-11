@@ -1,0 +1,88 @@
+name: Semantic version
+
+# Ecosystem-agnostic versioning primitive. Conventional-commit semver applies
+# identically to a NuGet package, an npm package and a Helm chart, so this is the
+# single place the next version is computed. Do not reimplement it inline.
+
+on:
+  workflow_call:
+    inputs:
+      prerelease_label:
+        description: 'Label used to build next_prerelease (e.g. "preview", "rc").'
+        required: false
+        type: string
+        default: preview
+      branch:
+        description: 'Branch to read conventional commits from. Defaults to the calling ref.'
+        required: false
+        type: string
+        default: ''
+    outputs:
+      current:
+        description: 'The most recent release tag, v-prefixed. v0.0.0 when the repo has no tags.'
+        value: ${{ jobs.version.outputs.current }}
+      next_semver:
+        description: 'Next version, no prefix (e.g. 1.2.0). Use this for package versions.'
+        value: ${{ jobs.version.outputs.next_semver }}
+      next_tag:
+        description: 'Next git tag, v-prefixed (e.g. v1.2.0). The only source of tag names.'
+        value: ${{ jobs.version.outputs.next_tag }}
+      next_prerelease:
+        description: 'Prerelease version, e.g. 1.2.0-preview.20260808.a1b2c3d.'
+        value: ${{ jobs.version.outputs.next_prerelease }}
+      short_sha:
+        description: 'Short SHA of the commit the version was computed from.'
+        value: ${{ jobs.version.outputs.short_sha }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      current: ${{ steps.semver.outputs.current }}
+      next_semver: ${{ steps.semver.outputs.nextStrict }}
+      next_tag: v${{ steps.semver.outputs.nextStrict }}
+      next_prerelease: ${{ steps.prerelease.outputs.version }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve commit metadata
+        id: meta
+        run: |
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "today=$(date -u +'%Y%m%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next semantic version
+        id: semver
+        uses: ietf-tools/semver-action@v1
+        with:
+          token: ${{ github.token }}
+          branch: ${{ inputs.branch || github.ref_name }}
+
+      - name: Compose prerelease version
+        id: prerelease
+        env:
+          NEXT: ${{ steps.semver.outputs.nextStrict }}
+          LABEL: ${{ inputs.prerelease_label }}
+          TODAY: ${{ steps.meta.outputs.today }}
+          SHA: ${{ steps.meta.outputs.short_sha }}
+        run: echo "version=${NEXT}-${LABEL}.${TODAY}.${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        env:
+          CURRENT: ${{ steps.semver.outputs.current }}
+          NEXT: ${{ steps.semver.outputs.nextStrict }}
+          PRE: ${{ steps.prerelease.outputs.version }}
+        run: |
+          {
+            echo "| | Version |"
+            echo "|---|---|"
+            echo "| Current tag | \`${CURRENT}\` |"
+            echo "| Next stable | \`${NEXT}\` |"
+            echo "| Next prerelease | \`${PRE}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

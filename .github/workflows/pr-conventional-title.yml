@@ -1,0 +1,38 @@
+name: Conventional PR title
+
+on:
+  workflow_call:
+    inputs:
+      types:
+        description: 'Newline-separated allowed conventional commit types.'
+        required: false
+        type: string
+        default: |
+          feat
+          fix
+          docs
+          test
+          refactor
+          perf
+          build
+          ci
+          chore
+          revert
+
+jobs:
+  title:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          types: ${{ inputs.types }}
+          requireScope: false
+          subjectPattern: ^(?![A-Z])(?!.*\.$).+$
+          subjectPatternError: |
+            The subject "{subject}" is invalid for the "{type}" title "{title}".
+            Start it lowercase and do not end with a period - it becomes a release
+            note line, so write it for someone reading the changelog.

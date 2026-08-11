@@ -1,0 +1,180 @@
+name: .NET library publish
+
+# Publishes stable packages to nuget.org. Intended to be called from a workflow
+# triggered by `release: [published]` - the release tag IS the version, so nothing
+# is computed and nothing is asserted by hand.
+
+on:
+  workflow_call:
+    inputs:
+      solution_file:
+        description: 'Solution or project to build, relative to cwd.'
+        required: false
+        type: string
+        default: ''
+      tag:
+        description: 'Release tag, with or without the leading v (e.g. v1.2.0).'
+        required: true
+        type: string
+      allow_prerelease:
+        description: 'Publish prerelease versions (any version containing a "-") to nuget.org.'
+        required: false
+        type: boolean
+        default: false
+      dotnet_versions:
+        description: 'Newline-separated SDK versions to install. List every target when a repo multi-targets.'
+        required: false
+        type: string
+        default: '10.0.x'
+      working_directory:
+        required: false
+        type: string
+        default: '.'
+    secrets:
+      nuget_user:
+        description: 'nuget.org profile name the Trusted Publishing policy is bound to. Not an email address.'
+        required: true
+    outputs:
+      version:
+        description: 'The published package version.'
+        value: ${{ jobs.publish.outputs.version }}
+
+# Never cancel a publish in flight, and never run two for the same version.
+concurrency:
+  group: publish-${{ github.repository }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+
+    env:
+      SOLUTION: ${{ inputs.solution_file }}
+
+    steps:
+      - name: Resolve version from tag
+        id: version
+        working-directory: .
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          VERSION="${TAG#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Tag '$TAG' does not carry a valid semantic version."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          case "$VERSION" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Validate publish configuration
+        if: ${{ steps.version.outputs.prerelease == 'false' || inputs.allow_prerelease }}
+        working-directory: .
+        env:
+          NUGET_USER: ${{ secrets.nuget_user }}
+        run: |
+          if [ -z "$NUGET_USER" ]; then
+            echo "::error::The nuget_user secret is empty, so the OIDC token exchange would fail after building. Set it with: gh secret set NUGET_USER --body '<nuget.org profile name>'"
+            exit 1
+          fi
+          echo "nuget_user is set."
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ inputs.dotnet_versions }}
+
+      - name: Restore
+        run: dotnet restore ${SOLUTION:+"$SOLUTION"}
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dotnet build ${SOLUTION:+"$SOLUTION"} \
+            --no-restore -c Release \
+            -p:Version="$VERSION" \
+            -p:ContinuousIntegrationBuild=true
+
+      - name: Test
+        run: dotnet test ${SOLUTION:+"$SOLUTION"} --no-build -c Release
+
+      - name: Pack
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          dotnet pack ${SOLUTION:+"$SOLUTION"} \
+            --no-build -c Release -o ./artifacts \
+            -p:Version="$VERSION" \
+            -p:PackageVersion="$VERSION" \
+            -p:ContinuousIntegrationBuild=true
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ steps.version.outputs.version }}
+          path: ${{ inputs.working_directory }}/artifacts/*
+          if-no-files-found: error
+
+      - name: Skip publish for prerelease version
+        if: ${{ steps.version.outputs.prerelease == 'true' && !inputs.allow_prerelease }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          echo "::notice::'$VERSION' is a prerelease and allow_prerelease is false - not pushed to nuget.org."
+          {
+            echo "### Not published"
+            echo ""
+            echo "\`${VERSION}\` is a prerelease version. nuget.org carries stable"
+            echo "releases only, where a version can be unlisted but never deleted."
+            echo ""
+            echo "The package was built, tested and packed, and is attached to this run"
+            echo "as an artifact. For a consumable prerelease use the preview workflow,"
+            echo "which publishes to GitHub Packages. To override, set"
+            echo "\`allow_prerelease: true\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to NuGet
+        id: nuget-login
+        if: ${{ steps.version.outputs.prerelease == 'false' || inputs.allow_prerelease }}
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.nuget_user }}
+
+      - name: Push to nuget.org
+        if: ${{ steps.version.outputs.prerelease == 'false' || inputs.allow_prerelease }}
+        env:
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+        run: |
+          dotnet nuget push "./artifacts/*.nupkg" \
+            --source https://api.nuget.org/v3/index.json \
+            --api-key "$NUGET_API_KEY" \
+            --skip-duplicate
+
+      - name: Summary
+        if: ${{ steps.version.outputs.prerelease == 'false' || inputs.allow_prerelease }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          {
+            echo "### Published"
+            echo ""
+            echo "\`${VERSION}\` -> [nuget.org](https://www.nuget.org/packages?q=${VERSION})"
+          } >> "$GITHUB_STEP_SUMMARY"
