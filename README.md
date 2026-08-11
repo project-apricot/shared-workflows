@@ -15,10 +15,22 @@ changes ship as `v2`, so repos migrate on their own schedule.
 | --- | --- |
 | `dotnet-lib-ci.yml` | Restore, build, test and pack. Publishes nothing. |
 | `release-prepare.yml` | Infer the next version from conventional commits, create the GitHub Release. |
-| `dotnet-lib-publish.yml` | Publish to nuget.org from a release tag, via OIDC trusted publishing. |
 | `dotnet-lib-preview.yml` | Publish a prerelease to GitHub Packages, on demand. |
 | `pr-conventional-title.yml` | Enforce conventional-commit PR titles. |
 | `version-semantic.yml` | Versioning primitive, ecosystem-agnostic. Used by the above; rarely called directly. |
+
+## Actions
+
+| Path | Purpose |
+| --- | --- |
+| `actions/dotnet-publish` | Build, test, pack and push a tagged library to nuget.org. |
+
+**Publishing to nuget.org must be a composite action, not a reusable workflow.** nuget.org
+validates the OIDC claim `job_workflow_ref` and requires it to start with
+`<owner>/<repo>/.github/workflows/`. A reusable workflow in this repo sets that claim to
+*its own* path, so the token exchange fails with HTTP 401 and no policy can allow it.
+Composite action steps run inside the caller's job, so the claim stays the calling
+repository's workflow. The calling job must grant `id-token: write` and check out the tag.
 
 Inputs, secrets and required caller permissions are documented in each file. GitHub only
 resolves reusable workflows directly under `.github/workflows/`, so the taxonomy lives in
@@ -32,7 +44,7 @@ The trigger is the signal — nothing declares "this is a real release":
 | --- | --- |
 | `pull_request`, `push` | validation only |
 | dispatch `release-prepare` | tag + GitHub Release |
-| `release: [published]` | publish to nuget.org |
+| `release: [published]` | publish to nuget.org (a local job using `actions/dotnet-publish`) |
 | dispatch `preview` | prerelease to GitHub Packages |
 
 A release is therefore two auditable steps: dispatch `release-prepare`, and the Release it
