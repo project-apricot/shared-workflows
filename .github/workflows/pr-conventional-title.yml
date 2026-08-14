@@ -31,8 +31,7 @@ jobs:
         with:
           types: ${{ inputs.types }}
           requireScope: false
-          subjectPattern: ^(?![A-Z])(?!.*\.$).+$
+          subjectPattern: ^(?!.*\.$).+$
           subjectPatternError: |
-            The subject "{subject}" is invalid for the "{type}" title "{title}".
-            Start it lowercase and do not end with a period - it becomes a release
-            note line, so write it for someone reading the changelog.
+            The subject "{subject}" in the title "{title}" ends with a period. It becomes
+            a release note line, so write it for someone reading the changelog.
