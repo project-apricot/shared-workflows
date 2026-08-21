@@ -1,0 +1,31 @@
+version: 2
+updates:
+
+  # This repo is where the third-party actions actually live, so it is the one place a bump
+  # reaches all consumers at once. `directories` rather than `directory`: `/` covers
+  # .github/workflows, and the glob covers each composite action, whose action.yml would
+  # otherwise go unwatched — including the one that publishes to nuget.org.
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/actions/*"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    # `fix`, not `ci`: here the workflows are the product. A `ci:` commit is not releasable, so
+    # an action bump would sit unreleased and never reach the repos pinning @v1.
+    commit-message:
+      prefix: "fix(deps)"
+    groups:
+      # Grouped so that a solo PR means a third-party action changed, which deserves a closer look
+      # than a first-party version bump.
+      github-owned-actions:
+        patterns:
+          - "actions/*"
+    ignore:
+      # An internal reusable workflow, deliberately pinned to the moving major tag.
+      - dependency-name: "project-apricot/shared-workflows"
