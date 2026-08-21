@@ -79,22 +79,14 @@ jobs:
       - name: Test
         if: ${{ inputs.run_tests }}
         run: |
-          # A repo opts into Microsoft.Testing.Platform in its own global.json. The two runners
-          # take different reporting flags, so detect rather than assume; drop the VSTest branch
-          # once every repo has opted in.
-          if grep -qE '"runner"[[:space:]]*:[[:space:]]*"Microsoft\.Testing\.Platform"' global.json 2>/dev/null; then
-            dotnet test ${SOLUTION:+"$SOLUTION"} \
-              --no-build -c Release \
-              --results-directory ./TestResults \
-              --coverlet --coverlet-output-format cobertura \
-              --report-trx
-          else
-            dotnet test ${SOLUTION:+"$SOLUTION"} \
-              --no-build -c Release \
-              --collect:"XPlat Code Coverage" \
-              --results-directory ./TestResults \
-              --logger "trx;LogFileName=test-results.trx"
-          fi
+          # Every repo opts into Microsoft.Testing.Platform in its global.json, so these are its
+          # reporting flags. No trx filename: each test assembly writes its own report, and a
+          # fixed name makes them overwrite each other.
+          dotnet test ${SOLUTION:+"$SOLUTION"} \
+            --no-build -c Release \
+            --results-directory ./TestResults \
+            --coverlet --coverlet-output-format cobertura \
+            --report-trx
 
       - name: Pack
         env:
