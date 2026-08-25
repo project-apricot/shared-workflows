@@ -1,0 +1,219 @@
+name: Release docs
+
+on:
+  workflow_call:
+    inputs:
+      library:
+        description: 'Slug of the library, used as its folder under content/docs/. Empty = this repository''s name. The site ignores a folder until the slug is added to libraries.json, so docs can land ahead of the manifest entry.'
+        required: false
+        type: string
+        default: ''
+      docs_path:
+        description: 'Folder in this repository holding the docs to mirror.'
+        required: false
+        type: string
+        default: docs
+      ref:
+        description: 'Ref to take the docs from — a tag for a release, a branch otherwise. Empty = the ref that triggered the run.'
+        required: false
+        type: string
+        default: ''
+      version:
+        description: 'Version this sync accompanies, for the commit and PR title. Empty = describe by ref.'
+        required: false
+        type: string
+        default: ''
+      docs_repository:
+        description: 'The documentation site repository.'
+        required: false
+        type: string
+        default: project-apricot/docs
+      auto_merge:
+        description: 'Enable auto-merge on the pull request so it lands once the site''s checks pass.'
+        required: false
+        type: boolean
+        default: true
+      dry_run:
+        description: 'Report the diff without pushing a branch or opening a PR.'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      docs_app_client_id:
+        description: 'Client ID of the GitHub App installed on the docs repository.'
+        required: true
+      docs_app_private_key:
+        description: 'Private key of that App.'
+        required: true
+    outputs:
+      changed:
+        description: 'true when the mirrored docs differed from what the site already had.'
+        value: ${{ jobs.sync.outputs.changed }}
+      pull_request:
+        description: 'URL of the pull request that was opened or updated. Empty when nothing changed.'
+        value: ${{ jobs.sync.outputs.pull_request }}
+
+# One sync per library at a time: two releases in quick succession would otherwise race on
+# the same branch and the second could push a tree built from the first one's checkout.
+concurrency:
+  group: docs-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync docs
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+      pull_request: ${{ steps.pr.outputs.url }}
+
+    steps:
+      - name: Resolve inputs
+        id: resolve
+        env:
+          LIBRARY: ${{ inputs.library }}
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ inputs.ref }}
+          DEFAULT_REF: ${{ github.ref_name }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          LIBRARY="${LIBRARY:-${REPOSITORY#*/}}"
+          REF="${REF:-$DEFAULT_REF}"
+
+          # What the commit and PR call this sync.
+          if [ -n "$VERSION" ]; then
+            DESCRIBED="${VERSION#v}"
+          else
+            DESCRIBED="$REF"
+          fi
+
+          echo "library=$LIBRARY" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "described=$DESCRIBED" >> "$GITHUB_OUTPUT"
+          echo "branch=docs/$LIBRARY" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the library
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.resolve.outputs.ref }}
+          path: library
+          persist-credentials: false
+
+      - name: Mint a token for the docs repository
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.docs_app_id }}
+          private-key: ${{ secrets.docs_app_private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.docs_repository }}
+
+      - name: Check out the documentation site
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.docs_repository }}
+          token: ${{ steps.token.outputs.token }}
+          path: site
+
+      - name: Validate
+        env:
+          DOCS_PATH: ${{ inputs.docs_path }}
+          REF: ${{ steps.resolve.outputs.ref }}
+        run: |
+          SOURCE="library/$DOCS_PATH"
+
+          if [ ! -d "$SOURCE" ]; then
+            echo "::error::$DOCS_PATH does not exist at $REF."
+            exit 1
+          fi
+
+          if [ -z "$(find "$SOURCE" -type f -name '*.md*' -print -quit)" ]; then
+            echo "::error::$DOCS_PATH contains no Markdown or MDX files. Refusing to publish an empty section."
+            exit 1
+          fi
+
+      - name: Mirror the docs
+        env:
+          DOCS_PATH: ${{ inputs.docs_path }}
+          LIBRARY: ${{ steps.resolve.outputs.library }}
+        run: |
+          TARGET="site/content/docs/$LIBRARY"
+          mkdir -p "$TARGET"
+
+          # --delete so a page removed upstream disappears from the site. The mirror is
+          # byte-for-byte: the site applies presentation at build time, never by editing.
+          rsync -a --delete "library/$DOCS_PATH/" "$TARGET/"
+
+      - name: Diff
+        id: diff
+        working-directory: site
+        run: |
+          if git diff --quiet && git diff --quiet --cached && [ -z "$(git status --porcelain)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Docs already match the site — nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            {
+              echo '### Docs changes'
+              echo
+              echo '```'
+              git status --porcelain
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Open or update the pull request
+        id: pr
+        if: ${{ steps.diff.outputs.changed == 'true' && !inputs.dry_run }}
+        working-directory: site
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+          LIBRARY: ${{ steps.resolve.outputs.library }}
+          DESCRIBED: ${{ steps.resolve.outputs.described }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_REF: ${{ steps.resolve.outputs.ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="docs($LIBRARY): sync from $DESCRIBED"
+          BODY=$(printf '%s\n\n%s\n' \
+            "Mirrored from \`$SOURCE_REPO@$SOURCE_REF\`." \
+            "Generated by [this run]($RUN_URL). Re-running the sync updates this pull request in place.")
+
+          git config user.name 'apricot-docs[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+          # A fixed branch per library, force-pushed: re-running replaces the proposal
+          # instead of stacking a second one.
+          git checkout -b "$BRANCH"
+          git add --all "content/docs/$LIBRARY"
+          git commit -m "$TITLE" -m "Mirrored from $SOURCE_REPO@$SOURCE_REF by $RUN_URL"
+          git push --force origin "$BRANCH"
+
+          URL="$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // empty')"
+
+          if [ -n "$URL" ]; then
+            gh pr edit "$URL" --title "$TITLE" --body "$BODY"
+            echo "Updated $URL" >> "$GITHUB_STEP_SUMMARY"
+          else
+            URL="$(gh pr create --title "$TITLE" --base main --head "$BRANCH" --body "$BODY")"
+            echo "Opened $URL" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge
+        if: ${{ steps.pr.outputs.url != '' && inputs.auto_merge }}
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          URL: ${{ steps.pr.outputs.url }}
+        run: |
+          # Only queues the merge — the site's required checks still gate it. A warning
+          # rather than a failure: the sync itself succeeded and the PR can be merged by hand.
+          if ! gh pr merge "$URL" --auto --squash; then
+            echo "::warning::Could not enable auto-merge on $URL. Check that the docs repository has auto-merge turned on and a required status check on main."
+          fi

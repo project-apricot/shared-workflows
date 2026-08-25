@@ -18,6 +18,7 @@ changes ship as `v2`, so repos migrate on their own schedule.
 | `dotnet-lib-preview.yml` | Publish a prerelease to GitHub Packages, on demand. |
 | `pr-conventional-title.yml` | Enforce conventional-commit PR titles. |
 | `version-semantic.yml` | Versioning primitive, ecosystem-agnostic. Used by the above; rarely called directly. |
+| `docs-release.yml` | Mirror a library's `docs/` into the documentation site as a pull request. |
 
 ## Actions
 
@@ -46,6 +47,7 @@ The trigger is the signal — nothing declares "this is a real release":
 | dispatch `release-prepare` | tag + GitHub Release |
 | `release: [published]` | publish to nuget.org (a local job using `actions/dotnet-publish`) |
 | dispatch `preview` | prerelease to GitHub Packages |
+| dispatch `docs` | mirror `docs/` into the documentation site |
 
 A release is therefore two auditable steps: dispatch `release-prepare`, and the Release it
 creates triggers the publish. The tag is the version; nobody types one by hand.
@@ -65,3 +67,64 @@ git tag -f v1 v1.2.0 && git push -f origin v1
 
 Test a change first by pointing a caller's `uses:` at a branch ref, with `dry_run: true`
 where supported.
+
+## Documentation
+
+`docs-release.yml` mirrors a library's `docs/` folder into
+[`project-apricot/docs`](https://github.com/project-apricot/docs), which builds
+projectapricot.dev. The library owns its docs; the site owns presentation and never edits the
+files it vendors, so the mirror is byte-for-byte and `--delete`d — a page removed upstream
+disappears from the site.
+
+Two callers per library:
+
+```yaml
+# docs.yml — standalone, when only the docs changed
+on: { workflow_dispatch: }
+jobs:
+  docs:
+    uses: project-apricot/shared-workflows/.github/workflows/docs-release.yml@v1
+    permissions: { contents: read }
+    secrets: inherit
+
+# release.yml — after a release actually reaches nuget.org
+  docs:
+    needs: [publish]
+    if: ${{ success() }}
+    uses: project-apricot/shared-workflows/.github/workflows/docs-release.yml@v1
+    permissions: { contents: read }
+    with:
+      ref: ${{ github.event.release.tag_name }}
+      version: ${{ github.event.release.tag_name }}
+    secrets: inherit
+```
+
+It pushes a fixed branch per library (`docs/<library>`) and opens a pull request, updating the
+open one in place rather than stacking a second. Auto-merge is enabled on it, so it lands by
+itself once the site's checks pass; merging to `main` is what triggers the deploy. Pass
+`auto_merge: false` to leave it for review.
+
+**Publication is opt-in, but the sync is not gated on it.** The site only builds libraries
+listed in its `libraries.json`, and ignores a `content/docs/<slug>/` folder that has no entry.
+That is deliberate: docs can be mirrored in and sit there until the manifest entry is added by
+hand, which is how a library gets published for the first time.
+
+### Credentials
+
+`GITHUB_TOKEN` cannot write to another repository, so the workflow mints a short-lived token
+from a GitHub App:
+
+| Secret | What |
+| --- | --- |
+| `DOCS_APP_CLIENT_ID` | Client ID of the App installed on the docs repository |
+| `DOCS_APP_PRIVATE_KEY` | Its private key |
+
+Both are org secrets, which is why callers can pass `secrets: inherit`. The App needs
+**Contents: read & write** and **Pull requests: read & write**, installed on
+`project-apricot/docs` **only** — it needs no access to the library repositories.
+
+Secrets are matched **by name**, case-insensitively. `secrets: inherit` hands the called
+workflow every secret the caller can see, under the names they already have, so the org secret
+`DOCS_APP_CLIENT_ID` satisfies this workflow's `secrets.docs_app_client_id`. The trade is that
+`inherit` skips the `required: true` contract — a missing secret surfaces as a failure at the
+token step, not as a workflow validation error.
