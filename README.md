@@ -85,7 +85,9 @@ jobs:
   docs:
     uses: project-apricot/shared-workflows/.github/workflows/docs-release.yml@v1
     permissions: { contents: read }
-    secrets: inherit
+    secrets:
+      docs_app_client_id: ${{ secrets.DOCS_APP_CLIENT_ID }}
+      docs_app_private_key: ${{ secrets.DOCS_APP_PRIVATE_KEY }}
 
 # release.yml — after a release actually reaches nuget.org
   docs:
@@ -96,7 +98,9 @@ jobs:
     with:
       ref: ${{ github.event.release.tag_name }}
       version: ${{ github.event.release.tag_name }}
-    secrets: inherit
+    secrets:
+      docs_app_client_id: ${{ secrets.DOCS_APP_CLIENT_ID }}
+      docs_app_private_key: ${{ secrets.DOCS_APP_PRIVATE_KEY }}
 ```
 
 It pushes a fixed branch per library (`docs/<library>`) and opens a pull request, updating the
@@ -119,12 +123,14 @@ from a GitHub App:
 | `DOCS_APP_CLIENT_ID` | Client ID of the App installed on the docs repository |
 | `DOCS_APP_PRIVATE_KEY` | Its private key |
 
-Both are org secrets, which is why callers can pass `secrets: inherit`. The App needs
-**Contents: read & write** and **Pull requests: read & write**, installed on
-`project-apricot/docs` **only** — it needs no access to the library repositories.
+Both are org secrets. The App needs **Contents: read & write** and **Pull requests: read &
+write**, installed on `project-apricot/docs` **only** — it needs no access to the library
+repositories.
 
-Secrets are matched **by name**, case-insensitively. `secrets: inherit` hands the called
-workflow every secret the caller can see, under the names they already have, so the org secret
-`DOCS_APP_CLIENT_ID` satisfies this workflow's `secrets.docs_app_client_id`. The trade is that
-`inherit` skips the `required: true` contract — a missing secret surfaces as a failure at the
-token step, not as a workflow validation error.
+**Callers must map the secrets explicitly; `secrets: inherit` does not work here.** Because
+this workflow declares them under `on.workflow_call.secrets`, those names become slots that
+only an explicit mapping fills. `inherit` passes the caller's secrets under their own names
+(`DOCS_APP_CLIENT_ID`), which does not populate the declared `docs_app_client_id` — the
+reusable workflow then sees an empty string and the token step fails with *"The 'client-id'
+input must be set to a non-empty string"*. Mapping by hand also restores the `required: true`
+check, so a missing secret is caught before the job starts.
