@@ -127,10 +127,9 @@ Both are org secrets. The App needs **Contents: read & write** and **Pull reques
 write**, installed on `project-apricot/docs` **only** — it needs no access to the library
 repositories.
 
-**Callers must map the secrets explicitly; `secrets: inherit` does not work here.** Because
-this workflow declares them under `on.workflow_call.secrets`, those names become slots that
-only an explicit mapping fills. `inherit` passes the caller's secrets under their own names
-(`DOCS_APP_CLIENT_ID`), which does not populate the declared `docs_app_client_id` — the
-reusable workflow then sees an empty string and the token step fails with *"The 'client-id'
-input must be set to a non-empty string"*. Mapping by hand also restores the `required: true`
-check, so a missing secret is caught before the job starts.
+Secrets are matched **by name**, case-insensitively, so `secrets: inherit` would also satisfy
+`docs_app_client_id` from the org secret `DOCS_APP_CLIENT_ID`. Callers map them explicitly
+anyway, for two reasons: `inherit` hands the called workflow *every* secret the caller can see
+— including the nuget.org credentials, which this workflow has no business holding — and it
+skips the `required: true` contract, so a missing secret fails mid-run at the token step
+instead of before the job starts.
