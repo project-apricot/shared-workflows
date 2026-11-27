@@ -1,0 +1,188 @@
+name: Helm chart publish
+
+# Publishes a chart from a release tag. The tag is the contract: release-prepare.yml creates it and
+# refuses to reuse one, so a plain chart version means exactly one tag and one immutable chart.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Git tag to publish, exactly as it is named (e.g. v1.2.0). The version is the tag without its leading v.'
+        required: true
+        type: string
+      chart_path:
+        description: 'Directory holding Chart.yaml.'
+        required: false
+        type: string
+        default: '.'
+      helm_version:
+        description: 'Helm version to install. Keep in step with helm-chart-ci.yml and helm-chart-preview.yml.'
+        required: false
+        type: string
+        default: 'v3.19.0'
+      registry:
+        description: 'OCI registry to log in to.'
+        required: false
+        type: string
+        default: 'ghcr.io'
+      oci_repository:
+        description: 'OCI repository to push to, without a scheme. helm appends the chart name, so the default resolves to ghcr.io/<owner>/<repo>/<chart>.'
+        required: false
+        type: string
+        default: 'ghcr.io/${{ github.repository }}'
+      allow_prerelease:
+        description: 'Push a prerelease version. Range constraints ignore prereleases, so consumers only get one by pinning it.'
+        required: false
+        type: boolean
+        default: true
+      update_dependencies:
+        description: 'Run helm dependency update before packaging.'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Package the chart without pushing it.'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      version:
+        description: 'The version that was published.'
+        value: ${{ jobs.publish.outputs.version }}
+      chart_oci_ref:
+        description: 'Full OCI reference of the published chart.'
+        value: ${{ jobs.publish.outputs.chart_oci_ref }}
+
+concurrency:
+  group: helm-chart-publish-${{ github.repository }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      chart_oci_ref: ${{ steps.report.outputs.chart_oci_ref }}
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      CHART: ${{ inputs.chart_path }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Resolve version from tag
+        id: version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          VERSION="${TAG#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Tag '$TAG' does not carry a valid semantic version."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          case "$VERSION" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: ${{ inputs.helm_version }}
+
+      - name: Resolve chart name
+        id: chart
+        run: |
+          NAME=$(yq -r '.name' "$CHART/Chart.yaml")
+          if [ -z "$NAME" ] || [ "$NAME" = "null" ]; then
+            echo "::error::Could not read .name from $CHART/Chart.yaml."
+            exit 1
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the OCI registry
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$TOKEN" | helm registry login "$REGISTRY" -u "$ACTOR" --password-stdin
+
+      - name: Update chart dependencies
+        if: ${{ inputs.update_dependencies }}
+        run: helm dependency update "$CHART"
+
+      - name: Lint chart
+        run: helm lint --strict "$CHART"
+
+      # The version is stamped at package time; Chart.yaml's own version is a placeholder. appVersion
+      # is deliberately left alone: it describes the application a chart deploys, not the chart.
+      - name: Package chart
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          helm package "$CHART" --version "$VERSION" --destination ./helm-out
+          shopt -s nullglob
+          FILES=(./helm-out/*.tgz)
+          if [ "${#FILES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one packaged chart in ./helm-out, found ${#FILES[@]}."
+            exit 1
+          fi
+          echo "path=${FILES[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload chart
+        uses: actions/upload-artifact@v7
+        with:
+          name: chart-${{ steps.version.outputs.version }}
+          path: ./helm-out/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+      - name: Skip publish for prerelease version
+        if: ${{ steps.version.outputs.prerelease == 'true' && !inputs.allow_prerelease }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          echo "::notice::'$VERSION' is a prerelease and allow_prerelease is false - not pushed."
+          {
+            echo "### Not published"
+            echo ""
+            echo "\`${VERSION}\` is a prerelease. The chart is attached to this run as an artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push chart
+        if: ${{ !inputs.dry_run && (steps.version.outputs.prerelease == 'false' || inputs.allow_prerelease) }}
+        env:
+          TGZ: ${{ steps.package.outputs.path }}
+          REPOSITORY: ${{ inputs.oci_repository }}
+        run: helm push "$TGZ" "oci://$REPOSITORY"
+
+      - name: Report
+        id: report
+        if: ${{ steps.version.outputs.prerelease == 'false' || inputs.allow_prerelease }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NAME: ${{ steps.chart.outputs.name }}
+          REPOSITORY: ${{ inputs.oci_repository }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          REF="oci://$REPOSITORY/$NAME:$VERSION"
+          echo "chart_oci_ref=$REF" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Published"
+            echo ""
+            echo "\`${REF}\` (dry run: $DRY)"
+          } >> "$GITHUB_STEP_SUMMARY"

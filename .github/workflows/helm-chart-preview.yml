@@ -1,0 +1,156 @@
+name: Helm chart preview
+
+# Publishes a prerelease chart to the OCI registry, on demand. No tag, no GitHub Release, nothing to
+# undo: this is how a consumer tries a chart change before it is cut. Helm range constraints ignore
+# prereleases, so a consumer pinned to ">=1.2.0" will not pick one up by accident; trying it means
+# pinning the exact prerelease version.
+
+on:
+  workflow_call:
+    inputs:
+      chart_path:
+        description: 'Directory holding Chart.yaml.'
+        required: false
+        type: string
+        default: '.'
+      helm_version:
+        description: 'Helm version to install. Keep in step with helm-chart-ci.yml and helm-chart-publish.yml.'
+        required: false
+        type: string
+        default: 'v3.19.0'
+      prerelease_label:
+        description: 'Label used to build the prerelease version (e.g. "preview", "rc").'
+        required: false
+        type: string
+        default: preview
+      registry:
+        description: 'OCI registry to log in to.'
+        required: false
+        type: string
+        default: 'ghcr.io'
+      oci_repository:
+        description: 'OCI repository to push to, without a scheme. helm appends the chart name, so the default resolves to ghcr.io/<owner>/<repo>/<chart>.'
+        required: false
+        type: string
+        default: 'ghcr.io/${{ github.repository }}'
+      update_dependencies:
+        description: 'Run helm dependency update before packaging.'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Package the chart without pushing it.'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      version:
+        description: 'The published prerelease version.'
+        value: ${{ jobs.preview.outputs.version }}
+      chart_oci_ref:
+        description: 'Full OCI reference of the published chart.'
+        value: ${{ jobs.preview.outputs.chart_oci_ref }}
+
+# Queue rather than cancel: a cancelled run could stop in the middle of a push.
+concurrency:
+  group: helm-chart-preview-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  version:
+    uses: project-apricot/shared-workflows/.github/workflows/version-semantic.yml@v1
+    permissions:
+      contents: read
+    with:
+      prerelease_label: ${{ inputs.prerelease_label }}
+
+  preview:
+    needs: [version]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      version: ${{ needs.version.outputs.next_prerelease }}
+      chart_oci_ref: ${{ steps.report.outputs.chart_oci_ref }}
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      CHART: ${{ inputs.chart_path }}
+      VERSION: ${{ needs.version.outputs.next_prerelease }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: ${{ inputs.helm_version }}
+
+      - name: Resolve chart name
+        id: chart
+        run: |
+          NAME=$(yq -r '.name' "$CHART/Chart.yaml")
+          if [ -z "$NAME" ] || [ "$NAME" = "null" ]; then
+            echo "::error::Could not read .name from $CHART/Chart.yaml."
+            exit 1
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the OCI registry
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          ACTOR: ${{ github.actor }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$TOKEN" | helm registry login "$REGISTRY" -u "$ACTOR" --password-stdin
+
+      - name: Update chart dependencies
+        if: ${{ inputs.update_dependencies }}
+        run: helm dependency update "$CHART"
+
+      - name: Lint chart
+        run: helm lint --strict "$CHART"
+
+      # The version is stamped at package time; Chart.yaml's own version is a placeholder. appVersion
+      # is deliberately left alone: it describes the application a chart deploys, not the chart.
+      - name: Package chart
+        id: package
+        run: |
+          helm package "$CHART" --version "$VERSION" --destination ./helm-out
+          shopt -s nullglob
+          FILES=(./helm-out/*.tgz)
+          if [ "${#FILES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one packaged chart in ./helm-out, found ${#FILES[@]}."
+            exit 1
+          fi
+          echo "path=${FILES[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Push chart
+        if: ${{ !inputs.dry_run }}
+        env:
+          TGZ: ${{ steps.package.outputs.path }}
+          REPOSITORY: ${{ inputs.oci_repository }}
+        run: helm push "$TGZ" "oci://$REPOSITORY"
+
+      - name: Report
+        id: report
+        env:
+          NAME: ${{ steps.chart.outputs.name }}
+          REPOSITORY: ${{ inputs.oci_repository }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          REF="oci://$REPOSITORY/$NAME:$VERSION"
+          echo "chart_oci_ref=$REF" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Preview published to the OCI registry"
+            echo ""
+            echo "\`${REF}\` (dry run: $DRY)"
+            echo ""
+            echo "Not tagged, no GitHub Release."
+          } >> "$GITHUB_STEP_SUMMARY"
