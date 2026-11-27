@@ -1,0 +1,265 @@
+name: Helm chart CI
+
+# Validates a chart on every pull request. Publishes nothing: the chart is packaged with a throwaway
+# version, so a chart that does not lint or package fails here rather than during a release.
+#
+# Beyond lint and package, each check is opt-in, so a chart can adopt them as it grows the files they
+# need. The scenarios they run against are the values files matching <chart_path>/ci/*-values.yaml.
+
+on:
+  workflow_call:
+    inputs:
+      chart_path:
+        description: 'Directory holding Chart.yaml.'
+        required: false
+        type: string
+        default: '.'
+      helm_version:
+        description: 'Helm version to install. Keep in step with helm-chart-preview.yml and helm-chart-publish.yml.'
+        required: false
+        type: string
+        default: 'v3.19.0'
+      update_dependencies:
+        description: 'Run helm dependency update before linting. Only a chart with its own dependencies needs it.'
+        required: false
+        type: boolean
+        default: false
+      unittest:
+        description: 'Run the chart unit tests (helm-unittest) from <chart_path>/tests.'
+        required: false
+        type: boolean
+        default: false
+      unittest_image:
+        description: 'helm-unittest image. The tag carries the Helm version it was built with.'
+        required: false
+        type: string
+        default: 'helmunittest/helm-unittest:3.19.0-1.0.3'
+      kubeconform:
+        description: 'Validate the rendered manifests of every scenario against Kubernetes schemas.'
+        required: false
+        type: boolean
+        default: false
+      kubeconform_image:
+        description: 'kubeconform image.'
+        required: false
+        type: string
+        default: 'ghcr.io/yannh/kubeconform:v0.7.0'
+      kube_versions:
+        description: 'JSON array of Kubernetes versions to validate against.'
+        required: false
+        type: string
+        default: '["1.30.0","1.32.0","1.34.0"]'
+      crd_schema_location:
+        description: 'kubeconform schema location for custom resources. Empty validates built-in kinds only.'
+        required: false
+        type: string
+        default: 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+      helm_docs:
+        description: 'Fail when the generated values documentation is out of date.'
+        required: false
+        type: boolean
+        default: false
+      helm_docs_image:
+        description: 'helm-docs image.'
+        required: false
+        type: string
+        default: 'jnorwood/helm-docs:v1.14.2'
+      helm_docs_template:
+        description: 'helm-docs template, relative to chart_path.'
+        required: false
+        type: string
+        default: 'docs/values.mdx.gotmpl'
+      helm_docs_output:
+        description: 'File helm-docs writes, relative to chart_path.'
+        required: false
+        type: string
+        default: 'docs/values.mdx'
+
+concurrency:
+  group: helm-chart-ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chart:
+    name: Lint and package
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      CHART: ${{ inputs.chart_path }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: ${{ inputs.helm_version }}
+
+      - name: Update chart dependencies
+        if: ${{ inputs.update_dependencies }}
+        run: helm dependency update "$CHART"
+
+      # --strict turns warnings into failures, and applies values.schema.json where the chart has one.
+      - name: Lint chart
+        run: helm lint --strict "$CHART"
+
+      - name: Lint scenarios
+        run: |
+          shopt -s nullglob
+          for f in "$CHART"/ci/*-values.yaml; do
+            echo "::group::$f"
+            helm lint --strict "$CHART" -f "$f"
+            echo "::endgroup::"
+          done
+
+      # The version is a throwaway. It only has to prove that the chart packages at all. The sha is
+      # prefixed because a numeric prerelease identifier may not start with 0, and a sha can.
+      - name: Package chart
+        env:
+          RUN: ${{ github.run_number }}
+          SHA: ${{ github.sha }}
+        run: |
+          helm package "$CHART" \
+            --version "0.0.0-ci.${RUN}.sha${SHA:0:7}" \
+            --destination ./helm-out
+
+      - name: Upload chart
+        uses: actions/upload-artifact@v7
+        with:
+          name: chart
+          path: ./helm-out/*.tgz
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
+
+  unittest:
+    name: Unit tests
+    if: ${{ inputs.unittest }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Helm
+        if: ${{ inputs.update_dependencies }}
+        uses: azure/setup-helm@v5
+        with:
+          version: ${{ inputs.helm_version }}
+
+      - name: Update chart dependencies
+        if: ${{ inputs.update_dependencies }}
+        env:
+          CHART: ${{ inputs.chart_path }}
+        run: helm dependency update "$CHART"
+
+      # Run as the runner's user so anything the tests write stays deletable by the job's cleanup.
+      - name: Run unit tests
+        env:
+          CHART: ${{ inputs.chart_path }}
+          IMAGE: ${{ inputs.unittest_image }}
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$PWD/$CHART":/chart -w /chart "$IMAGE" .
+
+  kubeconform:
+    name: Manifests (Kubernetes ${{ matrix.kube }})
+    if: ${{ inputs.kubeconform }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        kube: ${{ fromJson(inputs.kube_versions) }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: ${{ inputs.helm_version }}
+
+      - name: Update chart dependencies
+        if: ${{ inputs.update_dependencies }}
+        env:
+          CHART: ${{ inputs.chart_path }}
+        run: helm dependency update "$CHART"
+
+      - name: Validate manifests
+        env:
+          CHART: ${{ inputs.chart_path }}
+          KUBE: ${{ matrix.kube }}
+          IMAGE: ${{ inputs.kubeconform_image }}
+          CRDS: ${{ inputs.crd_schema_location }}
+        run: |
+          shopt -s nullglob
+          ARGS=(-strict -summary -kubernetes-version "$KUBE" -schema-location default)
+          if [ -n "$CRDS" ]; then ARGS+=(-schema-location "$CRDS"); fi
+
+          SCENARIOS=("$CHART"/ci/*-values.yaml)
+          if [ "${#SCENARIOS[@]}" -eq 0 ]; then
+            echo "::error::No scenarios found under $CHART/ci."
+            exit 1
+          fi
+
+          for f in "${SCENARIOS[@]}"; do
+            echo "::group::$f"
+            helm template example "$CHART" -f "$f" --kube-version "$KUBE" \
+              | docker run --rm -i "$IMAGE" "${ARGS[@]}" -
+            echo "::endgroup::"
+          done
+
+  docs:
+    name: Generated docs
+    if: ${{ inputs.helm_docs }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Generate values documentation
+        env:
+          CHART: ${{ inputs.chart_path }}
+          IMAGE: ${{ inputs.helm_docs_image }}
+          TEMPLATE: ${{ inputs.helm_docs_template }}
+          OUTPUT: ${{ inputs.helm_docs_output }}
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$PWD/$CHART":/chart -w /chart "$IMAGE" \
+            --chart-search-root . --sort-values-order file \
+            --template-files "$TEMPLATE" --output-file "$OUTPUT"
+
+      - name: Check the documentation is up to date
+        env:
+          CHART: ${{ inputs.chart_path }}
+          OUTPUT: ${{ inputs.helm_docs_output }}
+        run: |
+          if [ -n "$(git status --porcelain -- "$CHART/$OUTPUT")" ]; then
+            echo "::error::$CHART/$OUTPUT is out of date. Run helm-docs and commit the result."
+            git diff -- "$CHART/$OUTPUT"
+            exit 1
+          fi

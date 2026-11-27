@@ -14,6 +14,9 @@ changes ship as `v2`, so repos migrate on their own schedule.
 | File | Purpose |
 | --- | --- |
 | `dotnet-lib-ci.yml` | Restore, build, test and pack. Publishes nothing. |
+| `helm-chart-ci.yml` | Lint and package a chart; optionally unit tests (helm-unittest), manifest validation (kubeconform) and a generated-docs check. Publishes nothing. |
+| `helm-chart-preview.yml` | Publish a prerelease chart to the OCI registry, on demand. |
+| `helm-chart-publish.yml` | Publish a chart to the OCI registry from a release tag. |
 | `release-prepare.yml` | Infer the next version from conventional commits, create the GitHub Release. |
 | `dotnet-lib-preview.yml` | Publish a prerelease to GitHub Packages, on demand. |
 | `pr-conventional-title.yml` | Enforce conventional-commit PR titles. |
@@ -51,6 +54,26 @@ The trigger is the signal — nothing declares "this is a real release":
 
 A release is therefore two auditable steps: dispatch `release-prepare`, and the Release it
 creates triggers the publish. The tag is the version; nobody types one by hand.
+
+### Helm charts
+
+A chart follows the same model, with `helm-chart-publish.yml` in place of the nuget job. It is a
+reusable workflow rather than a composite action because the registry login uses `GITHUB_TOKEN`, not an
+OIDC claim. The chart's version comes from the tag when it is packaged, so `Chart.yaml` keeps a
+placeholder (`0.0.0`) and no commit ever bumps it.
+
+| Trigger in the calling repo | Result |
+| --- | --- |
+| `pull_request`, `push` | `helm-chart-ci.yml`: lint, package, and whichever checks the caller turns on |
+| dispatch `release-prepare` | tag + GitHub Release |
+| `release: [published]` | `helm-chart-publish.yml`: push `oci://ghcr.io/<owner>/<repo>/<chart>:<version>` |
+| dispatch `preview` | `helm-chart-preview.yml`: prerelease to the same registry, no tag |
+
+The optional checks in `helm-chart-ci.yml` run against the values files matching `ci/*-values.yaml` in the
+chart: each is linted and validated. Unit tests live in `tests/` (helm-unittest).
+
+The first push of a chart creates a *private* package. Make it public, and link it to the repository, in
+the package settings once.
 
 ## Releasing this repo
 
